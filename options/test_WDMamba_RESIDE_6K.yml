@@ -1,0 +1,80 @@
+# =========================
+# WDMamba test options
+# =========================
+
+# general settings
+name: WDMamba_6K_test
+model_type: FeMaSRModel
+scale: 1
+num_gpu: 1
+manual_seed: 666
+is_train: false
+
+# dataset and data loader settings
+datasets:
+  test:
+    name: General_Image_Test
+    type: PairedImageDataset
+
+    # ---- set your test paths here ----
+    dataroot_gt: /home/iris/data/ITS/clear
+    dataroot_lq: /home/iris/data/ITS/hazy
+
+    io_backend:
+      type: disk
+
+    # NOTE:
+    # For testing, usually keep original resolution (do NOT crop).
+    # If your dataset loader requires gt_size, set it to the same as training patch size;
+    # otherwise you can remove it. Here we keep it consistent with your config.
+    gt_size: 256
+    use_resize_crop: false
+    use_flip: false
+    use_rot: false
+
+# network settings (same as training)
+network_g:
+  type: WaveMamba
+  in_chn: 3
+  wf: 16
+  n_l_blocks: [1, 2, 2, 4]
+  ffn_scale: 2.0
+
+# paths
+path:
+  # ---- IMPORTANT: set to your trained generator weight ----
+  # examples:
+  #   experiments/WDMamba_6K/models/net_g_latest.pth
+  #   experiments/WDMamba_6K/models/net_g_10000.pth
+  pretrain_network_g: experiments/WDMamba_6K/models/net_g_latest.pth
+
+  strict_load: true
+  
+  models: experiments/WDMamba_6K/models
+  training_states: experiments/WDMamba_6K/training_states
+  visualization: results/WDMamba_test/visualization
+  resume_state: ~
+
+# validation / metrics (used by basicsr.test)
+val:
+  save_img: true
+  suffix: ~          # e.g., suffix: _WDMamba (optional)
+  key_metric: psnr
+
+  metrics:
+    psnr:
+      type: psnr
+      crop_border: 4
+      test_y_channel: true
+    ssim:
+      type: ssim
+      crop_border: 4
+      test_y_channel: true
+    lpips:
+      type: lpips
+      better: lower
+
+# logging
+logger:
+  print_freq: 1
+  use_tb_logger: false

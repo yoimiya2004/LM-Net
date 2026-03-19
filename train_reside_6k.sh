@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0,1 python basicsr/train.py -opt /home/iris/code/LM-Net2//options/train_WDMamba_RESIDE_6K.yml
