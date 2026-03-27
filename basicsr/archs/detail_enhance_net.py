@@ -74,6 +74,40 @@ class fft_bench(nn.Module):
         return self.main(x) + y
 
 
+class DGDFeedForward(nn.Module):
+    def __init__(self, dim, ffn_expansion_factor, bias):
+        super(DGDFeedForward, self).__init__()
+
+        hidden_features = int(dim * ffn_expansion_factor)
+        self.project_in1 = nn.Conv2d(dim, hidden_features * 2, kernel_size=1, bias=bias)
+        self.project_in2 = nn.Conv2d(dim, hidden_features, kernel_size=1, bias=bias)
+
+        self.dwconv1 = nn.Conv2d(hidden_features, hidden_features, kernel_size=5, stride=1, padding=2,
+                                 groups=hidden_features, bias=bias)
+        self.dwconv2 = nn.Conv2d(hidden_features, hidden_features, kernel_size=3, stride=1, padding=1,
+                                 groups=hidden_features, bias=bias)
+        self.dwconv3 = nn.Conv2d(hidden_features, hidden_features, kernel_size=3, stride=1, padding=1,
+                                 groups=hidden_features, bias=bias)
+
+        self.fusion = nn.Conv2d(hidden_features * 2, hidden_features, kernel_size=1, bias=bias)
+
+        self.project_out = nn.Conv2d(hidden_features, dim, kernel_size=1, bias=bias)
+
+    def forward(self, input):
+        x = self.project_in1(input)
+        x1, x2 = x.chunk(2, dim=1)
+        x1 = F.relu(self.dwconv1(x1))
+        x2 = F.relu(self.dwconv2(x2))
+        x12 = self.fusion(torch.cat((x1, x2), dim=1))
+
+        x3 = self.dwconv3(self.project_in2(input))
+
+        output = F.gelu(x3) * x12
+        output = self.project_out(output)
+
+        return output
+
+
 class Block(nn.Module):
     def __init__(self, conv, dim, kernel_size):
         super(Block, self).__init__()
@@ -81,6 +115,7 @@ class Block(nn.Module):
         self.conv1 = conv(dim, dim, kernel_size, bias=True)
         self.act1 = nn.ReLU(inplace=True)
         self.conv2 = conv(dim, dim, kernel_size, bias=True)
+        self.dgdffn = DGDFeedForward(dim, ffn_expansion_factor=1.0, bias=True)
         self.ublock = unetBlock(dim=dim)
 
     def forward(self, x):
@@ -88,6 +123,7 @@ class Block(nn.Module):
         res = self.act1(self.conv1(x))
         res = res + x
         res = self.conv2(res)
+        res = res + 0.1 * self.dgdffn(res)
         res = self.ublock(res)
         res += x
 

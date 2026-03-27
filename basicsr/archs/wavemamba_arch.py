@@ -6,7 +6,7 @@ from collections import OrderedDict
 import time
 from scipy.io import savemat
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
-from mamba_ssm import Mamba
+from mamba_ssm import Mamba3
 from einops import rearrange, repeat
 from functools import partial
 from timm.layers import DropPath, to_2tuple, trunc_normal_
@@ -190,222 +190,296 @@ class ffn(nn.Module):
         return self.net(x)
 
 
-class SS2D(nn.Module):
-    def __init__(
-            self,
-            d_model,
-            d_state=16,
-            d_conv=3,
-            expand=2,
-            dt_rank="auto",
-            dt_min=0.001,
-            dt_max=0.1,
-            dt_init="random",
-            dt_scale=1.0,
-            dt_init_floor=1e-4,
-            dropout=0.,
-            conv_bias=True,
-            bias=False,
-            device=None,
-            dtype=None,
-            **kwargs,
-    ):
-        factory_kwargs = {"device": device, "dtype": dtype}
-        super().__init__()
-        self.d_model = d_model
-        self.d_state = d_state
-        self.d_conv = d_conv
-        self.expand = expand
-        self.d_inner = int(self.expand * self.d_model)
-        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
+# class SS2D(nn.Module):
+#     def __init__(
+#             self,
+#             d_model,
+#             d_state=16,
+#             d_conv=3,
+#             expand=2,
+#             dt_rank="auto",
+#             dt_min=0.001,
+#             dt_max=0.1,
+#             dt_init="random",
+#             dt_scale=1.0,
+#             dt_init_floor=1e-4,
+#             dropout=0.,
+#             conv_bias=True,
+#             bias=False,
+#             device=None,
+#             dtype=None,
+#             **kwargs,
+#     ):
+#         factory_kwargs = {"device": device, "dtype": dtype}
+#         super().__init__()
+#         self.d_model = d_model
+#         self.d_state = d_state
+#         self.d_conv = d_conv
+#         self.expand = expand
+#         self.d_inner = int(self.expand * self.d_model)
+#         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
+#
+#         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
+#         self.conv2d = nn.Conv2d(
+#             in_channels=self.d_inner,
+#             out_channels=self.d_inner,
+#             groups=self.d_inner,
+#             bias=conv_bias,
+#             kernel_size=d_conv,
+#             padding=(d_conv - 1) // 2,
+#             **factory_kwargs,
+#         )
+#         self.act = nn.SiLU()
+#
+#         self.x_proj = (
+#             nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
+#             nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
+#             nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
+#             nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
+#         )
+#         self.x_proj_weight = nn.Parameter(torch.stack([t.weight for t in self.x_proj], dim=0))
+#         del self.x_proj
+#
+#         self.dt_proj = (
+#             nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs),
+#             nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs),
+#             nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs),
+#             nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs),
+#         )
+#         self.dt_proj_weight = nn.Parameter(torch.stack([t.weight for t in self.dt_proj], dim=0))
+#         self.dt_proj_bias = nn.Parameter(torch.stack([t.bias for t in self.dt_proj], dim=0))
+#         del self.dt_proj
+#
+#         self.A_logs = self.A_log_init(self.d_state, self.d_inner, copies=4, merge=True)
+#         self.Ds = self.D_init(self.d_inner, copies=4, merge=True)
+#
+#         self.out_norm = nn.LayerNorm(self.d_inner)
+#         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+#         self.dropout = nn.Dropout(dropout) if dropout > 0. else None
+#
+#     @staticmethod
+#     def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4,
+#                **factory_kwargs):
+#         dt_proj = nn.Linear(dt_rank, d_inner, bias=True, **factory_kwargs)
+#
+#         dt_init_std = dt_rank ** -0.5 * dt_scale
+#         if dt_init == "constant":
+#             nn.init.constant_(dt_proj.weight, dt_init_std)
+#         elif dt_init == "random":
+#             nn.init.uniform_(dt_proj.weight, -dt_init_std, dt_init_std)
+#         else:
+#             raise NotImplementedError
+#
+#         dt = torch.exp(
+#             torch.rand(d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+#             + math.log(dt_min)
+#         ).clamp(min=dt_init_floor)
+#         inv_dt = dt + torch.log(-torch.expm1(-dt))
+#         with torch.no_grad():
+#             dt_proj.bias.copy_(inv_dt)
+#         dt_proj.bias._no_reinit = True
+#
+#         return dt_proj
+#
+#     @staticmethod
+#     def A_log_init(d_state, d_inner, copies=1, device=None, merge=True):
+#         A = repeat(
+#             torch.arange(1, d_state + 1, dtype=torch.float32, device=device),
+#             "n -> d n",
+#             d=d_inner,
+#         ).contiguous()
+#         A = torch.log(A)
+#         if copies > 1:
+#             A = repeat(A, "d n -> r d n", r=copies)
+#             if merge:
+#                 A = A.flatten(0, 1)
+#         A_log = nn.Parameter(A)
+#         A_log._no_weight_decay = True
+#         return A_log
+#
+#     @staticmethod
+#     def D_init(d_inner, copies=1, device=None, merge=True):
+#         D = torch.ones(d_inner, device=device)
+#         if copies > 1:
+#             D = repeat(D, "n1 -> r n1", r=copies)
+#             if merge:
+#                 D = D.flatten(0, 1)
+#         D = nn.Parameter(D)
+#         D._no_weight_decay = True
+#         return D
+#
+#     def forward_corev0(self, x: torch.Tensor):
+#         self.selective_scan = selective_scan_fn
+#
+#         B, C, H, W = x.shape
+#         L = H * W
+#         K = 4
+#
+#         x_hwwh = torch.stack(
+#             [x.view(B, -1, L), torch.transpose(x, dim0=2, dim1=3).contiguous().view(B, -1, L)], dim=1
+#         ).view(B, 2, -1, L)
+#         xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1)
+#
+#         x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
+#         dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
+#         dts = torch.einsum("b k r l, k d r -> b k d l", dts.view(B, K, -1, L), self.dt_proj_weight)
+#
+#         xs = xs.float().view(B, -1, L)
+#         dts = dts.contiguous().float().view(B, -1, L)
+#         Bs = Bs.float().view(B, K, -1, L)
+#         Cs = Cs.float().view(B, K, -1, L)
+#         Ds = self.Ds.float().view(-1)
+#         As = -torch.exp(self.A_logs.float()).view(-1, self.d_state)
+#         dt_projs_bias = self.dt_proj_bias.float().view(-1)
+#
+#         out_y = self.selective_scan(
+#             xs, dts,
+#             As, Bs, Cs, Ds, z=None,
+#             delta_bias=dt_projs_bias,
+#             delta_softplus=True,
+#             return_last_state=False,
+#         ).view(B, K, -1, L)
+#         assert out_y.dtype == torch.float
+#
+#         inv_y = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
+#         wh_y = torch.transpose(out_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
+#         invwh_y = torch.transpose(inv_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
+#
+#         return out_y[:, 0], inv_y[:, 0], wh_y, invwh_y
+#
+#     def forward(self, x: torch.Tensor, **kwargs):
+#         B, H, W, C = x.shape
+#         xz = self.in_proj(x)
+#         x, z = xz.chunk(2, dim=-1)
+#
+#         x = x.permute(0, 3, 1, 2).contiguous()
+#         x = self.act(self.conv2d(x))
+#         y1, y2, y3, y4 = self.forward_corev0(x)
+#         y = y1 + y2 + y3 + y4
+#         y = torch.transpose(y, dim0=1, dim1=2).contiguous().view(B, H, W, -1)
+#         y = self.out_norm(y)
+#         y = y * F.silu(z)
+#         out = self.out_proj(y)
+#         if self.dropout is not None:
+#             out = self.dropout(out)
+#         return out
 
-        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
-        self.conv2d = nn.Conv2d(
-            in_channels=self.d_inner,
-            out_channels=self.d_inner,
-            groups=self.d_inner,
-            bias=conv_bias,
-            kernel_size=d_conv,
-            padding=(d_conv - 1) // 2,
-            **factory_kwargs,
-        )
-        self.act = nn.SiLU()
-
-        self.x_proj = (
-            nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
-            nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
-            nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
-            nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
-        )
-        self.x_proj_weight = nn.Parameter(torch.stack([t.weight for t in self.x_proj], dim=0))
-        del self.x_proj
-
-        self.dt_proj = (
-            nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs),
-            nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs),
-            nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs),
-            nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs),
-        )
-        self.dt_proj_weight = nn.Parameter(torch.stack([t.weight for t in self.dt_proj], dim=0))
-        self.dt_proj_bias = nn.Parameter(torch.stack([t.bias for t in self.dt_proj], dim=0))
-        del self.dt_proj
-
-        self.A_logs = self.A_log_init(self.d_state, self.d_inner, copies=4, merge=True)
-        self.Ds = self.D_init(self.d_inner, copies=4, merge=True)
-
-        self.out_norm = nn.LayerNorm(self.d_inner)
-        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
-        self.dropout = nn.Dropout(dropout) if dropout > 0. else None
-
-    @staticmethod
-    def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4,
-               **factory_kwargs):
-        dt_proj = nn.Linear(dt_rank, d_inner, bias=True, **factory_kwargs)
-
-        dt_init_std = dt_rank ** -0.5 * dt_scale
-        if dt_init == "constant":
-            nn.init.constant_(dt_proj.weight, dt_init_std)
-        elif dt_init == "random":
-            nn.init.uniform_(dt_proj.weight, -dt_init_std, dt_init_std)
-        else:
-            raise NotImplementedError
-
-        dt = torch.exp(
-            torch.rand(d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
-            + math.log(dt_min)
-        ).clamp(min=dt_init_floor)
-        inv_dt = dt + torch.log(-torch.expm1(-dt))
-        with torch.no_grad():
-            dt_proj.bias.copy_(inv_dt)
-        dt_proj.bias._no_reinit = True
-
-        return dt_proj
-
-    @staticmethod
-    def A_log_init(d_state, d_inner, copies=1, device=None, merge=True):
-        A = repeat(
-            torch.arange(1, d_state + 1, dtype=torch.float32, device=device),
-            "n -> d n",
-            d=d_inner,
-        ).contiguous()
-        A = torch.log(A)
-        if copies > 1:
-            A = repeat(A, "d n -> r d n", r=copies)
-            if merge:
-                A = A.flatten(0, 1)
-        A_log = nn.Parameter(A)
-        A_log._no_weight_decay = True
-        return A_log
-
-    @staticmethod
-    def D_init(d_inner, copies=1, device=None, merge=True):
-        D = torch.ones(d_inner, device=device)
-        if copies > 1:
-            D = repeat(D, "n1 -> r n1", r=copies)
-            if merge:
-                D = D.flatten(0, 1)
-        D = nn.Parameter(D)
-        D._no_weight_decay = True
-        return D
-
-    def forward_corev0(self, x: torch.Tensor):
-        self.selective_scan = selective_scan_fn
-
-        B, C, H, W = x.shape
-        L = H * W
-        K = 4
-
-        x_hwwh = torch.stack(
-            [x.view(B, -1, L), torch.transpose(x, dim0=2, dim1=3).contiguous().view(B, -1, L)], dim=1
-        ).view(B, 2, -1, L)
-        xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1)
-
-        x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
-        dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
-        dts = torch.einsum("b k r l, k d r -> b k d l", dts.view(B, K, -1, L), self.dt_proj_weight)
-
-        xs = xs.float().view(B, -1, L)
-        dts = dts.contiguous().float().view(B, -1, L)
-        Bs = Bs.float().view(B, K, -1, L)
-        Cs = Cs.float().view(B, K, -1, L)
-        Ds = self.Ds.float().view(-1)
-        As = -torch.exp(self.A_logs.float()).view(-1, self.d_state)
-        dt_projs_bias = self.dt_proj_bias.float().view(-1)
-
-        out_y = self.selective_scan(
-            xs, dts,
-            As, Bs, Cs, Ds, z=None,
-            delta_bias=dt_projs_bias,
-            delta_softplus=True,
-            return_last_state=False,
-        ).view(B, K, -1, L)
-        assert out_y.dtype == torch.float
-
-        inv_y = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
-        wh_y = torch.transpose(out_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
-        invwh_y = torch.transpose(inv_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
-
-        return out_y[:, 0], inv_y[:, 0], wh_y, invwh_y
-
-    def forward(self, x: torch.Tensor, **kwargs):
-        B, H, W, C = x.shape
-        xz = self.in_proj(x)
-        x, z = xz.chunk(2, dim=-1)
-
-        x = x.permute(0, 3, 1, 2).contiguous()
-        x = self.act(self.conv2d(x))
-        y1, y2, y3, y4 = self.forward_corev0(x)
-        y = y1 + y2 + y3 + y4
-        y = torch.transpose(y, dim0=1, dim1=2).contiguous().view(B, H, W, -1)
-        y = self.out_norm(y)
-        y = y * F.silu(z)
-        out = self.out_proj(y)
-        if self.dropout is not None:
-            out = self.dropout(out)
-        return out
 
 class LightSS2D(nn.Module):
+    @staticmethod
+    def _pick_mamba3_headdim(d_inner: int) -> int:
+        # Mamba-3 偏好硬件友好的 head dim，必须保证可整除
+        for cand in (64, 32, 16, 8, 4, 2, 1):
+            if d_inner % cand == 0:
+                return cand
+        return 1
 
     def __init__(
-        self,
-        d_model: int,
-        d_state: int = 16,
-        d_conv: int = 3,
-        expand: int = 2,
-        dropout: float = 0.0,
-        **kwargs,   # swallow SS2D-specific args safely (dt_rank, dt_min/max, etc.)
+            self,
+            d_model: int,
+            d_state: int = 16,
+            expand: int = 2,
+            mamba3_chunk_size: int = 64,
+            mamba3_is_mimo: bool = False,
+            mamba3_mimo_rank: int = 4,
+            mamba3_is_outproj_norm: bool = False,
+            dropout: float = 0.0,
+            **kwargs,
     ):
         super().__init__()
         self.d_model = d_model
-        self.mamba = Mamba(
+
+        if Mamba3 is None:
+            raise ImportError("mamba_ssm.Mamba3 is unavailable. Please upgrade mamba-ssm to >= 2.3.1.")
+
+        d_inner = int(expand * d_model)
+        headdim = self._pick_mamba3_headdim(d_inner)
+
+        if d_inner % headdim != 0:
+            raise ValueError(
+                f"Mamba3 requires expand*d_model divisible by headdim, got d_inner={d_inner}, headdim={headdim}.")
+
+        stage_d_state = max(d_state, min(64, d_model))
+        chunk_size = mamba3_chunk_size
+        if mamba3_is_mimo:
+            chunk_size = max(8, chunk_size // mamba3_mimo_rank)
+
+        # 实例化最新的 Mamba3
+        self.mamba = Mamba3(
             d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
+            d_state=stage_d_state,
             expand=expand,
+            headdim=headdim,
+            chunk_size=chunk_size,
+            is_mimo=mamba3_is_mimo,
+            mimo_rank=mamba3_mimo_rank,
+            is_outproj_norm=mamba3_is_outproj_norm,
         )
-        self.dropout = nn.Dropout(dropout) if (dropout and dropout > 0) else nn.Identity()
+
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         # x: (B, H, W, C)
         B, H, W, C = x.shape
-        if C != self.d_model:
-            raise RuntimeError(f"LightSS2D expects last dim={self.d_model}, got {C}")
+        assert C == self.d_model, f"LightSS2D expects last dim={self.d_model}, got {C}"
 
-        # stability for mixed precision
+        # Mamba-3 内核在 CUDA 上对 dtype 敏感；如果是在 CPU 上运行，强制转为 float 避免算子报错
         orig_dtype = x.dtype
-        if orig_dtype in (torch.float16, torch.bfloat16):
+        if (not x.is_cuda) and orig_dtype in (torch.float16, torch.bfloat16):
             x = x.float()
 
-        # flatten to sequence and apply 1D Mamba
-        y = x.view(B, H * W, C).contiguous()  # (B, HW, C)
-        y = self.mamba(y)                     # (B, HW, C)
+        # 展平为序列送入 Mamba-3
+        y = x.view(B, H * W, C).contiguous()
+        y = self.mamba(y)
         y = self.dropout(y)
-        y = y.view(B, H, W, C).contiguous()   # (B, H, W, C)
+        y = y.view(B, H, W, C).contiguous()
 
+        # 恢复原始数据类型
         if y.dtype != orig_dtype:
             y = y.to(orig_dtype)
         return y
 
+# class LightSS2D(nn.Module):
+#
+#     def __init__(
+#         self,
+#         d_model: int,
+#         d_state: int = 16,
+#         d_conv: int = 3,
+#         expand: int = 2,
+#         dropout: float = 0.0,
+#         **kwargs,   # swallow SS2D-specific args safely (dt_rank, dt_min/max, etc.)
+#     ):
+#         super().__init__()
+#         self.d_model = d_model
+#         self.mamba = Mamba(
+#             d_model=d_model,
+#             d_state=d_state,
+#             d_conv=d_conv,
+#             expand=expand,
+#         )
+#         self.dropout = nn.Dropout(dropout) if (dropout and dropout > 0) else nn.Identity()
+#
+#     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+#         # x: (B, H, W, C)
+#         B, H, W, C = x.shape
+#         if C != self.d_model:
+#             raise RuntimeError(f"LightSS2D expects last dim={self.d_model}, got {C}")
+#
+#         # stability for mixed precision
+#         orig_dtype = x.dtype
+#         if orig_dtype in (torch.float16, torch.bfloat16):
+#             x = x.float()
+#
+#         # flatten to sequence and apply 1D Mamba
+#         y = x.view(B, H * W, C).contiguous()  # (B, HW, C)
+#         y = self.mamba(y)                     # (B, HW, C)
+#         y = self.dropout(y)
+#         y = y.view(B, H, W, C).contiguous()   # (B, H, W, C)
+#
+#         if y.dtype != orig_dtype:
+#             y = y.to(orig_dtype)
+#         return y
 
 class LFSSBlock(nn.Module):
     def __init__(
@@ -420,28 +494,35 @@ class LFSSBlock(nn.Module):
     ):
         super().__init__()
         self.ln_1 = norm_layer(hidden_dim)
-        self.self_attention = LightSS2D(d_model=hidden_dim, d_state=d_state, expand=expand, dropout=attn_drop_rate, **kwargs)
+        # 这里自动调用的是我们上面更新好的基于 Mamba3 的 LightSS2D
+        self.self_attention = LightSS2D(d_model=hidden_dim, d_state=d_state, expand=expand, dropout=attn_drop_rate,
+                                        **kwargs)
         self.drop_path = DropPath(drop_path)
         self.skip_scale = nn.Parameter(torch.ones(hidden_dim))
+
+        # 假设 ffn 已在你的代码其他地方定义
         self.conv_blk = ffn(hidden_dim)
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.skip_scale2 = nn.Parameter(torch.ones(hidden_dim))
 
     def forward(self, input, x_size):
-        # x [B,HW,C]
+        # input: [B, HW, C]
         B, L, C = input.shape
-        input = input.view(B, *x_size, C).contiguous()  # [B,H,W,C]
-        x = self.ln_1(input)
-        x = input * self.skip_scale + self.drop_path(self.self_attention(x))
-        x = x * self.skip_scale2 + self.conv_blk(self.ln_2(x).permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous()
-        x = x.view(B, -1, C).contiguous()
+        input_2d = input.view(B, *x_size, C).contiguous()  # [B, H, W, C]
+
+        x = self.ln_1(input_2d)
+        x = input_2d * self.skip_scale + self.drop_path(self.self_attention(x))
+        x = x * self.skip_scale2 + self.conv_blk(self.ln_2(x).permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3,
+                                                                                                        1).contiguous()
+
+        x = x.view(B, -1, C).contiguous()  # 转回 [B, HW, C]
         return x
 
 
 class MambaBlock(nn.Module):
     def __init__(self, dim, n_l_blocks=1, expand=2):
         super().__init__()
-        self.l_blk = nn.Sequential(*[LFSSBlock(dim) for _ in range(n_l_blocks)])
+        self.l_blk = nn.Sequential(*[LFSSBlock(dim, expand=expand) for _ in range(n_l_blocks)])
 
     def forward(self, x_LL):
         b, c, h, w = x_LL.shape
@@ -450,6 +531,50 @@ class MambaBlock(nn.Module):
             x_LL = l_layer(x_LL, [h, w])
         x_LL = rearrange(x_LL, "b (h w) c -> b c h w", h=h, w=w).contiguous()
         return x_LL
+
+# class LFSSBlock(nn.Module):
+#     def __init__(
+#             self,
+#             hidden_dim: int = 0,
+#             drop_path: float = 0,
+#             norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+#             attn_drop_rate: float = 0,
+#             d_state: int = 16,
+#             expand: float = 2.,
+#             **kwargs,
+#     ):
+#         super().__init__()
+#         self.ln_1 = norm_layer(hidden_dim)
+#         self.self_attention = LightSS2D(d_model=hidden_dim, d_state=d_state, expand=expand, dropout=attn_drop_rate, **kwargs)
+#         self.drop_path = DropPath(drop_path)
+#         self.skip_scale = nn.Parameter(torch.ones(hidden_dim))
+#         self.conv_blk = ffn(hidden_dim)
+#         self.ln_2 = nn.LayerNorm(hidden_dim)
+#         self.skip_scale2 = nn.Parameter(torch.ones(hidden_dim))
+#
+#     def forward(self, input, x_size):
+#         # x [B,HW,C]
+#         B, L, C = input.shape
+#         input = input.view(B, *x_size, C).contiguous()  # [B,H,W,C]
+#         x = self.ln_1(input)
+#         x = input * self.skip_scale + self.drop_path(self.self_attention(x))
+#         x = x * self.skip_scale2 + self.conv_blk(self.ln_2(x).permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous()
+#         x = x.view(B, -1, C).contiguous()
+#         return x
+#
+#
+# class MambaBlock(nn.Module):
+#     def __init__(self, dim, n_l_blocks=1, expand=2):
+#         super().__init__()
+#         self.l_blk = nn.Sequential(*[LFSSBlock(dim) for _ in range(n_l_blocks)])
+#
+#     def forward(self, x_LL):
+#         b, c, h, w = x_LL.shape
+#         x_LL = rearrange(x_LL, "b c h w -> b (h w) c").contiguous()
+#         for l_layer in self.l_blk:
+#             x_LL = l_layer(x_LL, [h, w])
+#         x_LL = rearrange(x_LL, "b (h w) c -> b c h w", h=h, w=w).contiguous()
+#         return x_LL
 
 
 class UNetConvBlock(nn.Module):
