@@ -189,11 +189,58 @@ class ffn(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+class SeparableMamba(nn.Module):
+    """
+    SeparableMamba:
+      - row-wise Mamba: process each row as a length-W sequence -> (B*H, W, C)
+      - col-wise Mamba: process each column as a length-H sequence -> (B*W, H, C)
+      - fuse: 'add' or 'concat' (then 1x1 conv)
+    注意：保持 d_model == C（与 LightSS2D 语义一致）
+    """
+    def __init__(self,
+                 d_model,
+                 d_state=64,
+                 expand=2,
+                 fuse_mode='add',
+                 mamba_kwargs=None):
+        super().__init__()
+        if mamba_kwargs is None:
+            mamba_kwargs = {}
+        # 两个 Mamba3 实例（row/col），参数可不共享
+        self.m_row = Mamba3(d_model=d_model, d_state=d_state, expand=expand, **mamba_kwargs)
+        self.m_col = Mamba3(d_model=d_model, d_state=d_state, expand=expand, **mamba_kwargs)
+        self.fuse_mode = fuse_mode
+        if fuse_mode == 'concat':
+            # concat 后 channel => 2*C，需要 1x1 投影回 C
+            self.fuse_conv = nn.Conv2d(2 * d_model, d_model, kernel_size=1)
+        else:
+            self.fuse_conv = None
 
+    def forward(self, x):
+        # x: (B, H, W, C)
+        B, H, W, C = x.shape
+
+        row_in = x.view(B * H, W, C)
+        row_out = self.m_row(row_in)  # (B*H, W, C)
+        row_out = row_out.view(B, H, W, C)
+
+        col_in = x.permute(0, 2, 1, 3).contiguous().view(B * W, H, C)
+        col_out = self.m_col(col_in)  # (B*W, H, C)
+        col_out = col_out.view(B, W, H, C).permute(0, 2, 1, 3).contiguous()  # back to (B,H,W,C)
+
+        if self.fuse_mode == 'add':
+            out = row_out + col_out
+        else:
+            out = torch.cat([row_out, col_out], dim=-1)  # (B,H,W,2C)
+            # fuse_conv expects (B, C, H, W)
+            out = self.fuse_conv(out.permute(0, 3, 1, 2)).permute(0, 2, 3, 1).contiguous()
+        return out
+
+
+# 修改 LightSS2D：增加两个新参数 use_spatial_adaptive, cond_channels
 class LightSS2D(nn.Module):
     @staticmethod
     def _pick_mamba3_headdim(d_inner: int) -> int:
-        # Mamba-3 偏好硬件友好的 head dim，必须保证可整除
         for cand in (64, 32, 16, 8, 4, 2, 1):
             if d_inner % cand == 0:
                 return cand
@@ -205,31 +252,39 @@ class LightSS2D(nn.Module):
             d_state: int = 16,
             expand: int = 2,
             mamba3_chunk_size: int = 64,
-            mamba3_is_mimo: bool = True,
+            mamba3_is_mimo: bool = False,
             mamba3_mimo_rank: int = 4,
-            mamba3_is_outproj_norm: bool = True,
+            mamba3_is_outproj_norm: bool = False,
             dropout: float = 0.0,
+            # new options
+            use_spatial_adaptive: bool = False,
+            cond_channels: int = 0,
+            # allow passing raw kwargs to Mamba3
+            mamba_kwargs: dict = None,
             **kwargs,
     ):
         super().__init__()
         self.d_model = d_model
+        self.use_spatial_adaptive = use_spatial_adaptive
+        self.cond_channels = cond_channels
 
         if Mamba3 is None:
             raise ImportError("mamba_ssm.Mamba3 is unavailable. Please upgrade mamba-ssm to >= 2.3.1.")
 
         d_inner = int(expand * d_model)
         headdim = self._pick_mamba3_headdim(d_inner)
-
         if d_inner % headdim != 0:
-            raise ValueError(
-                f"Mamba3 requires expand*d_model divisible by headdim, got d_inner={d_inner}, headdim={headdim}.")
+            raise ValueError(f"Mamba3 requires expand*d_model divisible by headdim, got d_inner={d_inner}, headdim={headdim}.")
 
         stage_d_state = max(d_state, min(64, d_model))
         chunk_size = mamba3_chunk_size
         if mamba3_is_mimo:
             chunk_size = max(8, chunk_size // mamba3_mimo_rank)
 
-        # 实例化最新的 Mamba3
+        if mamba_kwargs is None:
+            mamba_kwargs = {}
+
+        # 实例化 Mamba3（SISO or MIMO 由 mamba3_is_mimo 控制）
         self.mamba = Mamba3(
             d_model=d_model,
             d_state=stage_d_state,
@@ -239,7 +294,24 @@ class LightSS2D(nn.Module):
             is_mimo=mamba3_is_mimo,
             mimo_rank=mamba3_mimo_rank,
             is_outproj_norm=mamba3_is_outproj_norm,
+            **mamba_kwargs,
         )
+
+        # Spatially-adaptive cond_net (SAM-B) — 生成 per-pos channel-wise modulation
+        if self.use_spatial_adaptive and self.cond_channels > 0:
+            mid = max(16, self.cond_channels)
+            # 输出两组 scale/bias（或者只scale），这里用2x scale for in/out
+            self.cond_net = nn.Sequential(
+                nn.Conv2d(d_model, mid, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(mid, d_model * 2, kernel_size=1)  # produce scale_in and scale_out per channel
+            )
+            # init small
+            nn.init.normal_(self.cond_net[-1].weight, mean=0.0, std=1e-3)
+            if self.cond_net[-1].bias is not None:
+                nn.init.constant_(self.cond_net[-1].bias, 0.0)
+        else:
+            self.cond_net = None
 
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
@@ -248,18 +320,30 @@ class LightSS2D(nn.Module):
         B, H, W, C = x.shape
         assert C == self.d_model, f"LightSS2D expects last dim={self.d_model}, got {C}"
 
-        # Mamba-3 内核在 CUDA 上对 dtype 敏感；如果是在 CPU 上运行，强制转为 float 避免算子报错
         orig_dtype = x.dtype
         if (not x.is_cuda) and orig_dtype in (torch.float16, torch.bfloat16):
             x = x.float()
 
-        # 展平为序列送入 Mamba-3
-        y = x.view(B, H * W, C).contiguous()
-        y = self.mamba(y)
-        y = self.dropout(y)
-        y = y.view(B, H, W, C).contiguous()
+        # spatial-adaptive modulation (lightweight). cond_net outputs (B, 2*C, H, W)
+        if self.cond_net is not None:
+            cond = self.cond_net(x.permute(0, 3, 1, 2))  # B, 2C, H, W
+            cond = cond.permute(0, 2, 3, 1).contiguous()  # B, H, W, 2C
+            cond = cond.view(B, H * W, 2, C)  # B, L, 2, C
+            scale_in = 0.1 * torch.tanh(cond[:, :, 0, :])   # small-scale in [-0.1,0.1]
+            scale_out = 0.1 * torch.tanh(cond[:, :, 1, :])  # small-scale for out
+            x_seq = x.view(B, H * W, C) * (1.0 + scale_in)  # modulate input
+        else:
+            x_seq = x.view(B, H * W, C)
 
-        # 恢复原始数据类型
+        # Mamba forward (sequence)
+        y_seq = self.mamba(x_seq)  # (B, L, C)
+
+        if self.cond_net is not None:
+            y_seq = y_seq * (1.0 + scale_out)
+
+        y = y_seq.view(B, H, W, C).contiguous()
+        y = self.dropout(y)
+
         if y.dtype != orig_dtype:
             y = y.to(orig_dtype)
         return y
@@ -306,6 +390,7 @@ class LightSS2D(nn.Module):
 #             y = y.to(orig_dtype)
 #         return y
 
+# 修改 LFSSBlock：增加 attention_type 参数 ('mamba' | 'separable' | 'hybrid')
 class LFSSBlock(nn.Module):
     def __init__(
             self,
@@ -315,39 +400,87 @@ class LFSSBlock(nn.Module):
             attn_drop_rate: float = 0,
             d_state: int = 16,
             expand: float = 2.,
+            attention_type: str = 'mamba',  # new: 'mamba' | 'separable' | 'hybrid'
+            mamba_kwargs: dict = None,
+            use_spatial_adaptive: bool = False,
+            cond_channels: int = 0,
+            local_window: int = 7,
             **kwargs,
     ):
         super().__init__()
         self.ln_1 = norm_layer(hidden_dim)
-        # 这里自动调用的是我们上面更新好的基于 Mamba3 的 LightSS2D
-        self.self_attention = LightSS2D(d_model=hidden_dim, d_state=d_state, expand=expand, dropout=attn_drop_rate,
-                                        **kwargs)
+
+        # choose which mixer to use
+        if attention_type == 'mamba':
+            self.self_attention = LightSS2D(d_model=hidden_dim,
+                                           d_state=d_state,
+                                           expand=expand,
+                                           dropout=attn_drop_rate,
+                                           use_spatial_adaptive=use_spatial_adaptive,
+                                           cond_channels=cond_channels,
+                                           mamba_kwargs=mamba_kwargs,
+                                           **kwargs)
+        elif attention_type == 'separable':
+            self.self_attention = SeparableMamba(d_model=hidden_dim,
+                                                d_state=d_state,
+                                                expand=expand,
+                                                fuse_mode=kwargs.get('separable_fuse', 'add'),
+                                                mamba_kwargs=mamba_kwargs)
+        elif attention_type == 'hybrid':
+            # local module: small conv-based local refinement
+            self.local = nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            )
+            self.global_mamba = LightSS2D(d_model=hidden_dim,
+                                          d_state=d_state,
+                                          expand=expand,
+                                          dropout=attn_drop_rate,
+                                          use_spatial_adaptive=use_spatial_adaptive,
+                                          cond_channels=cond_channels,
+                                          mamba_kwargs=mamba_kwargs,
+                                          **kwargs)
+            # gating conv: take concat of local/global in channels
+            self.gate_conv = nn.Conv2d(2 * hidden_dim, hidden_dim, kernel_size=1)
+        else:
+            raise ValueError(f'Unknown attention_type {attention_type}')
+
         self.drop_path = DropPath(drop_path)
         self.skip_scale = nn.Parameter(torch.ones(hidden_dim))
-
-        # 假设 ffn 已在你的代码其他地方定义
         self.conv_blk = ffn(hidden_dim)
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.skip_scale2 = nn.Parameter(torch.ones(hidden_dim))
 
     def forward(self, input, x_size):
-        # input: [B, HW, C]
         B, L, C = input.shape
-        input_2d = input.view(B, *x_size, C).contiguous()  # [B, H, W, C]
+        H, W = x_size
+        input_2d = input.view(B, H, W, C).contiguous()  # [B, H, W, C]
 
         x = self.ln_1(input_2d)
-        x = input_2d * self.skip_scale + self.drop_path(self.self_attention(x))
-        x = x * self.skip_scale2 + self.conv_blk(self.ln_2(x).permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3,
-                                                                                                        1).contiguous()
 
-        x = x.view(B, -1, C).contiguous()  # 转回 [B, HW, C]
+        if hasattr(self, 'local') and hasattr(self, 'global_mamba'):
+            # hybrid
+            # local: expect channels-first
+            local_feat = self.local(x.permute(0,3,1,2)).permute(0,2,3,1).contiguous()
+            global_feat = self.global_mamba(x)
+            concat = torch.cat([local_feat, global_feat], dim=-1)
+            gate = self.gate_conv(concat.permute(0,3,1,2)).permute(0,2,3,1).contiguous()
+            attn_out = gate
+        else:
+            attn_out = self.self_attention(x)
+
+        x = input_2d * self.skip_scale + self.drop_path(attn_out)
+        x = x * self.skip_scale2 + self.conv_blk(self.ln_2(x).permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous()
+
+        x = x.view(B, -1, C).contiguous()
         return x
 
-
 class MambaBlock(nn.Module):
-    def __init__(self, dim, n_l_blocks=1, expand=2):
+    def __init__(self, dim, n_l_blocks=1, expand=2, **kwargs):
         super().__init__()
-        self.l_blk = nn.Sequential(*[LFSSBlock(dim, expand=expand) for _ in range(n_l_blocks)])
+        self.l_blk = nn.Sequential(*[LFSSBlock(dim, expand=expand, **kwargs) for _ in range(n_l_blocks)])
+
 
     def forward(self, x_LL):
         b, c, h, w = x_LL.shape
