@@ -1,0 +1,154 @@
+name: LDM-Net_Haze4K_separable_sam
+model_type: FeMaSRModel
+scale: &upscale 1
+num_gpu: 1
+manual_seed: 666
+
+datasets:
+  train:
+    name: General_Image_Train
+    type: PairedImageDataset
+    dataroot_gt: /home/iris/data/Haze_4K/gt
+    dataroot_lq: /home/iris/data/Haze_4K/hazy
+    io_backend:
+      type: disk
+    gt_size: 256
+    use_resize_crop: False
+    use_flip: True
+    use_rot: False
+    use_shuffle: true
+    geometric_augs: True
+    batch_size_per_gpu: &bsz 4
+    num_worker_per_gpu: *bsz
+    dataset_enlarge_ratio: 1
+    prefetch_mode: cpu
+    num_prefetch_queue: *bsz
+
+  val:
+    name: General_Image_Valid
+    type: PairedImageDataset
+    dataroot_gt: /home/iris/data/SOTS/outdoor/gt
+    dataroot_lq: /home/iris/data/SOTS/outdoor/hazy
+    gt_size: 400
+    io_backend:
+      type: disk
+    geometric_augs: True
+    use_resize_crop: False
+    use_flip: False
+    use_rot: False
+
+# network
+network_g:
+  type: WaveMamba
+  in_chn: 3
+  wf: 16
+  n_l_blocks: [1,2,2,4]
+  ffn_scale: 2.0
+
+  # mamba3 settings
+  use_mamba3: true
+  mamba3_is_mimo: true           # 轻量化优先，若有 kernel 再开启
+  mamba3_d_state: 64
+  mamba3_headdim: 16
+  mamba3_chunk_size: 64
+  mamba3_is_outproj_norm: true
+
+  # block options (透传给 MambaBlock/LFSSBlock)
+  attention_type: separable       # 'mamba' | 'separable' | 'hybrid'
+  separable_fuse: add             # 'add' or 'concat'
+  use_spatial_adaptive: true
+  cond_channels: 0                # 若 >0 则 cond_net 会输出 cond_channels*? (we set cond channels indirectly in code)
+  local_window: 7
+
+network_d:
+  type: UNetDiscriminatorSN
+  num_in_ch: 3
+
+path:
+  pretrain_network_hq: ~
+  pretrain_network_g: ~
+  pretrain_network_d: ~
+  strict_load: false
+  resume_state: ~
+
+train:
+  optim_g:
+    type: AdamW
+    lr: !!float 3e-4
+    weight_decay: !!float 1e-3
+    betas: [0.9, 0.99]
+  optim_d:
+    type: Adam
+    lr: !!float 4e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: CosineAnnealingRestartCyclicLR
+    periods: [100, 500000]
+    restart_weights: [1, 1]
+    eta_mins: [0.0005, 0.0000001]
+
+  total_iter: 500000
+  warmup_iter: 3000
+
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+  pixel_ssim_opt:
+    loss_weight: !!float 0.25
+
+  fft_opt:
+    type: FFTLoss
+    loss_weight: !!float 0.1
+
+  perceptual_opt:
+    type: LPIPSLoss
+    loss_weight: !!float 0
+
+  gan_opt:
+    type: GANLoss
+    gan_type: hinge
+    real_label_val: 1.0
+    fake_label_val: 0.0
+    loss_weight: 0
+
+  codebook_opt:
+    loss_weight: 0
+
+  semantic_opt:
+    loss_weight: 0
+
+  net_d_iters: 0
+  net_d_init_iters: !!float 0
+
+val:
+  val_freq: !!float 5000
+  save_img: true
+  key_metric: psnr
+  metrics:
+    psnr:
+      type: psnr
+      crop_border: 4
+      test_y_channel: true
+    ssim:
+      type: ssim
+      crop_border: 4
+      test_y_channel: true
+    lpips:
+      type: lpips
+      better: lower
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: !!float 5000
+  save_latest_freq: !!float 5e3
+  show_tf_imgs_freq: !!float 5000
+  use_tb_logger: true
+
+dist_params:
+  backend: nccl
+  port: 25975
+
+find_unused_parameters: true

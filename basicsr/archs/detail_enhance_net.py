@@ -74,38 +74,117 @@ class fft_bench(nn.Module):
         return self.main(x) + y
 
 
-class DGDFeedForward(nn.Module):
-    def __init__(self, dim, ffn_expansion_factor, bias):
-        super(DGDFeedForward, self).__init__()
+class FullCapacityDGDFFN(nn.Module):
+    """
+    全容量深度门控前馈网络 (Full-Capacity DGD-FFN)
+    回应缺陷一：恢复 5x5 与双 3x3 分支的复杂门控交互，最大化局部纹理的建模容量。
+    """
 
-        hidden_features = int(dim * ffn_expansion_factor)
-        self.project_in1 = nn.Conv2d(dim, hidden_features * 2, kernel_size=1, bias=bias)
-        self.project_in2 = nn.Conv2d(dim, hidden_features, kernel_size=1, bias=bias)
+    def __init__(self, channels, expansion_factor=2.0):
+        super(FullCapacityDGDFFN, self).__init__()
+        hidden_channels = int(channels * expansion_factor)
 
-        self.dwconv1 = nn.Conv2d(hidden_features, hidden_features, kernel_size=5, stride=1, padding=2,
-                                 groups=hidden_features, bias=bias)
-        self.dwconv2 = nn.Conv2d(hidden_features, hidden_features, kernel_size=3, stride=1, padding=1,
-                                 groups=hidden_features, bias=bias)
-        self.dwconv3 = nn.Conv2d(hidden_features, hidden_features, kernel_size=3, stride=1, padding=1,
-                                 groups=hidden_features, bias=bias)
+        # 第一次输入投影，扩张特征空间
+        self.project_in = nn.Conv2d(channels, hidden_channels * 2, kernel_size=1, bias=False)
 
-        self.fusion = nn.Conv2d(hidden_features * 2, hidden_features, kernel_size=1, bias=bias)
+        # 复杂多分支深度卷积
+        # 分支 1：串联两个 3x3，获取等效 5x5 的精细局部非线性
+        self.dwconv_3x3_1 = nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1,
+                                      groups=hidden_channels, bias=False)
+        self.dwconv_3x3_2 = nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1,
+                                      groups=hidden_channels, bias=False)
 
-        self.project_out = nn.Conv2d(hidden_features, dim, kernel_size=1, bias=bias)
+        # 分支 2：单层 5x5，直接获取较大的局部感知域
+        self.dwconv_5x5 = nn.Conv2d(hidden_channels, hidden_channels, kernel_size=5, padding=2, groups=hidden_channels,
+                                    bias=False)
 
-    def forward(self, input):
-        x = self.project_in1(input)
-        x1, x2 = x.chunk(2, dim=1)
-        x1 = F.relu(self.dwconv1(x1))
-        x2 = F.relu(self.dwconv2(x2))
-        x12 = self.fusion(torch.cat((x1, x2), dim=1))
+        self.act = nn.GELU()
 
-        x3 = self.dwconv3(self.project_in2(input))
+        # 第二次投影，压缩回原通道
+        self.project_out = nn.Conv2d(hidden_channels, channels, kernel_size=1, bias=False)
 
-        output = F.gelu(x3) * x12
-        output = self.project_out(output)
+    def forward(self, x):
+        x_in = self.project_in(x)
+        x_branch1, x_branch2 = x_in.chunk(2, dim=1)
 
-        return output
+        # 细粒度非线性分支 (两个 3x3)
+        feat1 = self.dwconv_3x3_1(x_branch1)
+        feat1 = self.dwconv_3x3_2(self.act(feat1))
+
+        # 略大感知分支 (5x5)
+        feat2 = self.dwconv_5x5(x_branch2)
+
+        # 高维分支融合与门控乘法
+        gated_feat = self.act(feat1) * feat2
+
+        return self.project_out(gated_feat)
+
+
+class AtrousContextCompletion(nn.Module):
+    """
+    空洞上下文补全模块 (ACCM)
+    回应缺陷二：利用多膨胀率深度卷积模拟 U-Block 的多尺度上下文聚合，
+    在 100% 保持空间分辨率的前提下，具备强大的“缺失结构补全/幻觉”能力。
+    """
+
+    def __init__(self, channels):
+        super(AtrousContextCompletion, self).__init__()
+
+        # 模拟 U-Net 的多尺度层级 (RF 指数级放大)
+        # d=1 (模拟原分辨率), d=2 (模拟下采样1次), d=4 (模拟下采样2次), d=8 (模拟下采样3次)
+        self.branch_d1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, dilation=1, groups=channels,
+                                   bias=False)
+        self.branch_d2 = nn.Conv2d(channels, channels, kernel_size=3, padding=2, dilation=2, groups=channels,
+                                   bias=False)
+        self.branch_d4 = nn.Conv2d(channels, channels, kernel_size=3, padding=4, dilation=4, groups=channels,
+                                   bias=False)
+        self.branch_d8 = nn.Conv2d(channels, channels, kernel_size=3, padding=8, dilation=8, groups=channels,
+                                   bias=False)
+
+        self.act = nn.GELU()
+
+        # 跨尺度信息聚合 (1x1 卷积将所有尺度的结构特征压缩融合)
+        self.aggregator = nn.Conv2d(channels * 4, channels, kernel_size=1, bias=False)
+
+    def forward(self, x):
+        feat_d1 = self.branch_d1(x)
+        feat_d2 = self.branch_d2(x)
+        feat_d4 = self.branch_d4(x)
+        feat_d8 = self.branch_d8(x)
+
+        # 在通道维度拼接所有尺度的结构特征
+        concat_feat = torch.cat([feat_d1, feat_d2, feat_d4, feat_d8], dim=1)
+
+        # 聚合输出
+        out = self.aggregator(self.act(concat_feat))
+        return out
+
+
+class HCBlock(nn.Module):
+    """
+    最终组装：高容量无损细节保留块 (HC-LDB)
+    """
+
+    def __init__(self, channels):
+        super(HCBlock, self).__init__()
+
+        # 先利用高容量模块细化局部纹理
+        self.local_refine = FullCapacityDGDFFN(channels)
+
+        # 再利用多空洞模块补全全局上下文
+        self.context_complete = AtrousContextCompletion(channels)
+
+        self.norm1 = nn.BatchNorm2d(channels)
+        self.norm2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        # 步骤 1: 局部纹理细化 + 残差
+        res1 = self.local_refine(self.norm1(x)) + x
+
+        # 步骤 2: 多尺度上下文聚合 + 残差
+        out = self.context_complete(self.norm2(res1)) + res1
+
+        return out
 
 
 class Block(nn.Module):
@@ -115,7 +194,6 @@ class Block(nn.Module):
         self.conv1 = conv(dim, dim, kernel_size, bias=True)
         self.act1 = nn.ReLU(inplace=True)
         self.conv2 = conv(dim, dim, kernel_size, bias=True)
-        self.dgdffn = DGDFeedForward(dim, ffn_expansion_factor=1.0, bias=True)
         self.ublock = unetBlock(dim=dim)
 
     def forward(self, x):
@@ -123,7 +201,6 @@ class Block(nn.Module):
         res = self.act1(self.conv1(x))
         res = res + x
         res = self.conv2(res)
-        res = res + 0.1 * self.dgdffn(res)
         res = self.ublock(res)
         res += x
 
@@ -133,7 +210,8 @@ class Block(nn.Module):
 class Group(nn.Module):
     def __init__(self, conv, dim, kernel_size, blocks):
         super(Group, self).__init__()
-        modules = [Block(conv, dim, kernel_size) for _ in range(blocks)]
+        # modules = [Block(conv, dim, kernel_size) for _ in range(blocks)]
+        modules = [HCBlock(dim) for _ in range(blocks)]
         modules.append(conv(dim, dim, kernel_size))
         self.gp = nn.Sequential(*modules)
 
