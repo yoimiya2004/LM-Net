@@ -20,6 +20,7 @@ import torch.autograd
 from basicsr.archs.detail_enhance_net import DENet
 from basicsr.archs.wavelet import DWT, IWT
 
+
 class Attention(nn.Module):
     def __init__(self, in_planes, out_planes, kernel_size, groups=1, reduction=0.0625, kernel_num=4, min_channel=16):
         super(Attention, self).__init__()
@@ -97,8 +98,7 @@ class Attention(nn.Module):
         return self.func_channel(x), self.func_filter(x), self.func_spatial(x), self.func_kernel(x)
 
 
-
-# Layer Norm
+# Layer normalization
 class LayerNorm(nn.Module):
     def __init__(self, normalized_shape, eps=1e-6, data_format="channels_first"):
         super().__init__()
@@ -168,9 +168,9 @@ class ECAAttention(nn.Module):
 
     def __init__(self, kernel_size=3):
         super().__init__()
-        self.gap=nn.AdaptiveAvgPool2d(1)
-        self.conv=nn.Conv1d(1,1,kernel_size=kernel_size,padding=(kernel_size-1)//2)
-        self.sigmoid=nn.Sigmoid()
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=kernel_size, padding=(kernel_size - 1) // 2)
+        self.sigmoid = nn.Sigmoid()
 
     def init_weights(self):
         for m in self.modules():
@@ -187,26 +187,30 @@ class ECAAttention(nn.Module):
                     init.constant_(m.bias, 0)
 
     def forward(self, x):
-        y=self.gap(x) #bs,c,1,1
-        y=y.squeeze(-1).permute(0,2,1) #bs,1,c
-        y=self.conv(y) #bs,1,c
-        y=self.sigmoid(y) #bs,1,c
-        y=y.permute(0,2,1).unsqueeze(-1) #bs,c,1,1
-        return x*y.expand_as(x)
+        y = self.gap(x)  # bs,c,1,1
+        y = y.squeeze(-1).permute(0, 2, 1)  # bs,1,c
+        y = self.conv(y)  # bs,1,c
+        y = self.sigmoid(y)  # bs,1,c
+        y = y.permute(0, 2, 1).unsqueeze(-1)  # bs,c,1,1
+        return x * y.expand_as(x)
 
 
 class HFCAttention(nn.Module):
     """
-    专门针对雾霾频带的频率通道注意力模块 (HFCAttention)
-    创新点：利用 2D 快速傅里叶变换提取各通道的低频幅度谱（表征全局雾霾能量），
-    以此引导模型自适应地为不同通道分配权重，解决雾霾在不同颜色通道衰减不一致的问题。
+    Frequency-channel attention module specifically designed for haze-related bands (HFCAttention).
+
+    Key idea:
+    It uses a 2D Fast Fourier Transform to extract the low-frequency amplitude spectrum of
+    each channel, which represents the global haze energy. The module then adaptively assigns
+    channel-wise weights based on this information, helping address inconsistent attenuation
+    across different color channels under haze.
     """
 
     def __init__(self, channels, reduction=16):
         super(HFCAttention, self).__init__()
         mid_channels = max(1, channels // reduction)
 
-        # 使用 MLP 学习不同通道在低频雾霾频带上的相互关系
+        # Use an MLP to learn cross-channel relationships in the low-frequency haze band
         self.mlp = nn.Sequential(
             nn.Linear(channels, mid_channels, bias=False),
             nn.ReLU(inplace=True),
@@ -217,28 +221,30 @@ class HFCAttention(nn.Module):
     def forward(self, x):
         b, c, h, w = x.shape
 
-        # 1. 2D 傅里叶变换转换到频域
-        # rfft2 输出形状为 [B, C, H, W//2 + 1]
+        # 1. Transform to the frequency domain with 2D FFT
+        # rfft2 output shape: [B, C, H, W//2 + 1]
         fft_x = torch.fft.rfft2(x, norm='backward')
 
-        # 2. 提取幅度谱 (Amplitude Spectrum)
+        # 2. Extract the amplitude spectrum
         amp = torch.abs(fft_x)
 
-        # 3. 低频截取 (Low-Frequency Cropping)
-        # 根据 WDMamba 先验，雾霾主要在低频。rfft2 的低频集中在左上角。
-        # 这里我们截取幅度谱的前 25% (即 1/4 区域) 作为核心雾霾频带
+        # 3. Low-frequency cropping
+        # Following the WDMamba prior, haze mainly lies in low frequencies.
+        # In rfft2, low-frequency components are concentrated in the upper-left region.
+        # Here we crop the first 25% (i.e., the 1/4 region) as the core haze frequency band.
         h_low = max(1, amp.shape[2] // 4)
         w_low = max(1, amp.shape[3] // 4)
         low_freq_amp = amp[:, :, :h_low, :w_low]
 
-        # 4. 频域全局池化：计算每个通道的“低频雾霾总能量”
+        # 4. Global pooling in the frequency domain:
+        # compute the "total low-frequency haze energy" for each channel
         freq_energy = low_freq_amp.mean(dim=(2, 3))  # Shape: [B, C]
 
-        # 5. 通过 MLP 生成通道注意力权重
+        # 5. Generate channel attention weights through the MLP
         channel_weights = self.mlp(freq_energy)  # Shape: [B, C]
         channel_weights = channel_weights.view(b, c, 1, 1)
 
-        # 6. 将频率感知的权重作用回原始空间域特征
+        # 6. Apply the frequency-aware weights back to the original spatial-domain features
         return x * channel_weights
 
 
@@ -253,10 +259,10 @@ class ffn(nn.Module):
         self.activation = activation()
         self.use_attention = use_attention
         if use_attention:
-            # 注意：特征在经过 x.chunk(2) 之后才会送入 attention，因此通道数是 dw_channel // 2
+            # Note: features are passed into attention only after x.chunk(2),
+            # so the channel count here is dw_channel // 2
             attention_channels = self.dw_channel // 2
             self.hfc_attention = HFCAttention(channels=attention_channels)
-        # --------------------------------------------------------
 
     def forward(self, x):
         x = self.conv2(self.conv1(x))
@@ -346,7 +352,7 @@ class SS2D(nn.Module):
                 **factory_kwargs):
         dt_proj = nn.Linear(dt_rank, d_inner, bias=True, **factory_kwargs)
 
-        # Initialize special dt projection to preserve variance at initialization
+        # Initialize the special dt projection to preserve variance at initialization
         dt_init_std = dt_rank ** -0.5 * dt_scale
         if dt_init == "constant":
             nn.init.constant_(dt_proj.weight, dt_init_std)
@@ -364,7 +370,8 @@ class SS2D(nn.Module):
         inv_dt = dt + torch.log(-torch.expm1(-dt))
         with torch.no_grad():
             dt_proj.bias.copy_(inv_dt)
-        # Our initialization would set all Linear.bias to zero, need to mark this one as _no_reinit
+        # Our initialization would set all Linear.bias to zero,
+        # so we need to mark this one as _no_reinit
         dt_proj.bias._no_reinit = True
 
         return dt_proj
@@ -388,7 +395,7 @@ class SS2D(nn.Module):
 
     @staticmethod
     def D_init(d_inner, copies=1, device=None, merge=True):
-        # D "skip" parameter
+        # D skip parameter
         D = torch.ones(d_inner, device=device)
         if copies > 1:
             D = repeat(D, "n1 -> r n1", r=copies)
@@ -475,12 +482,13 @@ class LFSSBlock(nn.Module):
         self.skip_scale2 = nn.Parameter(torch.ones(hidden_dim))
 
     def forward(self, input, x_size):
-        # x [B,HW,C]
+        # x [B, HW, C]
         B, L, C = input.shape
-        input = input.view(B, *x_size, C).contiguous()  # [B,H,W,C]
+        input = input.view(B, *x_size, C).contiguous()  # [B, H, W, C]
         x = self.ln_1(input)
         x = input * self.skip_scale + self.drop_path(self.self_attention(x))
-        x = x * self.skip_scale2 + self.conv_blk(self.ln_2(x).permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous()
+        x = x * self.skip_scale2 + self.conv_blk(self.ln_2(x).permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3,
+                                                                                                        1).contiguous()
         x = x.view(B, -1, C).contiguous()
         return x
 
@@ -530,7 +538,7 @@ class UNetUpBlock(nn.Module):
         )
 
     def forward(self, x, bridge):
-        # 上采样输入特征图 x
+        # Upsample the input feature map x
         up = self.up(x)
 
         diff_h = bridge.size(2) - up.size(2)
@@ -539,10 +547,10 @@ class UNetUpBlock(nn.Module):
         up = F.pad(up, [diff_w // 2, diff_w - diff_w // 2,
                         diff_h // 2, diff_h - diff_h // 2])
 
-        # 拼接上采样后的特征图和跳跃连接特征图
+        # Concatenate the upsampled feature map with the skip connection feature map
         out = torch.cat([up, bridge], dim=1)
 
-        # 通过卷积块处理拼接后的特征图
+        # Process the concatenated feature map through the convolution block
         out = self.conv_block(out)
         return out
 
@@ -605,9 +613,14 @@ class HA_LWT(nn.Module):
 
 class HazeDensityEstimator(nn.Module):
     """
-    空间信噪比评估器 (Spatial SNR Estimator)
-    利用第一阶段的低频输出预测空间信噪比图 (SNR Map)
-    输出值越接近 1 代表雾越薄（信噪比高），越接近 0 代表雾越浓（细节丢失严重）
+    Spatial SNR estimator.
+
+    It predicts a spatial signal-to-noise ratio map (SNR Map) from the low-frequency
+    output of the first stage.
+
+    Values closer to 1 indicate thinner haze (higher SNR),
+    while values closer to 0 indicate denser haze
+    (more severe detail loss).
     """
 
     def __init__(self, in_channels=3):
@@ -616,7 +629,7 @@ class HazeDensityEstimator(nn.Module):
             nn.Conv2d(in_channels, 16, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(16, 1, kernel_size=3, padding=1),
-            nn.Sigmoid()  # 将权重归一化到 0~1 之间，作为软路由权重
+            nn.Sigmoid()  # Normalize the weights to [0, 1] as soft routing weights
         )
 
     def forward(self, low_freq_img):
@@ -627,24 +640,16 @@ class DynamicDetailConv(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3):
         super(DynamicDetailConv, self).__init__()
         padding = kernel_size // 2
-
-        # 专家 1：负责“薄雾区”的高频细节锐化与纹理提取 (Clear Expert)
         self.expert_clear = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding)
-
-        # 专家 2：负责“浓雾区”的平滑去噪与结构修复 (Dense Expert)
-        # 创新点：使用 dilation=2 扩大感受野，更利于浓雾区域的上下文修复
         self.expert_dense = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, dilation=2)
-
-        # 可选：特征融合层
         self.fuse = nn.Conv2d(out_channels, out_channels, kernel_size=1)
 
     def forward(self, x, snr_map):
-        # snr_map 维度: [B, 1, H, W]
+        # snr_map shape: [B, 1, H, W]
         feat_clear = self.expert_clear(x)
         feat_dense = self.expert_dense(x)
 
-        # 像素级软路由匹配 (Pixel-wise Soft Routing)：
-        # 信噪比高的地方倾向于用 expert_clear，低的地方倾向于用 expert_dense
+        # Pixel-wise soft routing:
         out = snr_map * feat_clear + (1.0 - snr_map) * feat_dense
 
         return self.fuse(out)
@@ -657,9 +662,7 @@ class SNR_DDE_Module(nn.Module):
         self.dynamic_conv = DynamicDetailConv(channels, channels)
 
     def forward(self, x_stage1, output_LL):
-        # 1. 用第一阶段重建的干净低频图 (output_LL) 评估信噪比
         snr_map = self.estimator(output_LL)
-        # 2. 对第一阶段的初步去雾图 (x_stage1) 进行动态特征重塑
         x_refined = self.dynamic_conv(x_stage1, snr_map)
         return x_refined, snr_map
 
@@ -689,7 +692,7 @@ class UNet(nn.Module):
         self.down_group3 = MambaBlock(128, n_l_blocks=n_l_blocks[2], expand=ffn_scale)
         self.down_group4 = MambaBlock(256, n_l_blocks=n_l_blocks[3], expand=ffn_scale)
 
-        # decoder of UNet-64
+        # Decoder of UNet-64
         self.up_group4 = MambaBlock(128, n_l_blocks=n_l_blocks[3], expand=ffn_scale)
         self.up_group3 = MambaBlock(64, n_l_blocks=n_l_blocks[2], expand=ffn_scale)
         self.up_group2 = MambaBlock(32, n_l_blocks=n_l_blocks[1], expand=ffn_scale)
@@ -697,7 +700,6 @@ class UNet(nn.Module):
 
         self.snr_dde = SNR_DDE_Module(channels=in_chn)
         self.DE = DENet(3, 6)  # self.DE = DENet(3, 4) for real_haze
-
 
     def forward(self, x):
 
@@ -780,61 +782,48 @@ class WaveMamba(nn.Module):
 
     @torch.no_grad()
     def test_tile(self, input, tile_size=240, tile_pad=16):
-        # return self.test(input)
-        """It will first crop input images to tiles, and then process each tile.
-        Finally, all the processed tiles are merged into one images.
-        Modified from: https://github.com/xinntao/Real-ESRGAN/blob/master/realesrgan/utils.py
-        """
+
         batch, channel, height, width = input.shape
         output_height = height * self.scale_factor
         output_width = width * self.scale_factor
         output_shape = (batch, channel, output_height, output_width)
 
-        # start with black image
         output = input.new_zeros(output_shape)
         tiles_x = math.ceil(width / tile_size)
         tiles_y = math.ceil(height / tile_size)
 
-        # loop over all tiles
         for y in range(tiles_y):
             for x in range(tiles_x):
-                # extract tile from input image
                 ofs_x = x * tile_size
                 ofs_y = y * tile_size
-                # input tile area on total image
+
                 input_start_x = ofs_x
                 input_end_x = min(ofs_x + tile_size, width)
                 input_start_y = ofs_y
                 input_end_y = min(ofs_y + tile_size, height)
 
-                # input tile area on total image with padding
                 input_start_x_pad = max(input_start_x - tile_pad, 0)
                 input_end_x_pad = min(input_end_x + tile_pad, width)
                 input_start_y_pad = max(input_start_y - tile_pad, 0)
                 input_end_y_pad = min(input_end_y + tile_pad, height)
 
-                # input tile dimensions
                 input_tile_width = input_end_x - input_start_x
                 input_tile_height = input_end_y - input_start_y
                 tile_idx = y * tiles_x + x + 1
                 input_tile = input[:, :, input_start_y_pad:input_end_y_pad, input_start_x_pad:input_end_x_pad]
 
-                # upscale tile
                 output_tile = self.test(input_tile)
 
-                # output tile area on total image
                 output_start_x = input_start_x * self.scale_factor
                 output_end_x = input_end_x * self.scale_factor
                 output_start_y = input_start_y * self.scale_factor
                 output_end_y = input_end_y * self.scale_factor
 
-                # output tile area without padding
                 output_start_x_tile = (input_start_x - input_start_x_pad) * self.scale_factor
                 output_end_x_tile = output_start_x_tile + input_tile_width * self.scale_factor
                 output_start_y_tile = (input_start_y - input_start_y_pad) * self.scale_factor
                 output_end_y_tile = output_start_y_tile + input_tile_height * self.scale_factor
 
-                # put tile into output image
                 output[:, :, output_start_y:output_end_y,
                 output_start_x:output_end_x] = output_tile[:, :, output_start_y_tile:output_end_y_tile,
                                                output_start_x_tile:output_end_x_tile]
@@ -873,7 +862,7 @@ if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     x = torch.randn(1, 3, 1920, 1280).to(device)
     model = UNet(in_chn=3, wf=32, n_l_blocks=[1, 2, 4], n_h_blocks=[1, 1, 1], ffn_scale=2).to(device)
-    #    print(model)
+    # print(model)
     inp_shape = (3, 512, 512)
     from ptflops import get_model_complexity_info
 
@@ -887,7 +876,6 @@ if __name__ == '__main__':
 
     print('mac', macs)
     print(f'params: {sum(map(lambda x: x.numel(), model.parameters()))}')
-    # print(flop_count_table(FlopCountAnalysis(model, x), activations=ActivationCountAnalysis(model, x)))
     with torch.no_grad():
         torch.cuda.reset_max_memory_allocated(device)
         start_time = time.time()

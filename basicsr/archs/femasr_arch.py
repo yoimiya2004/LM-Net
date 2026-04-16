@@ -3,6 +3,10 @@ import torch.nn.functional as F
 from torch import nn as nn
 import numpy as np
 import math
+from pdb import set_trace as stx
+import numbers
+
+from einops import rearrange
 
 from basicsr.utils.registry import ARCH_REGISTRY
 
@@ -117,15 +121,6 @@ class LayerNorm(nn.Module):
         return to_4d(self.body(to_3d(x)), h, w)
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import sys
-from pdb import set_trace as stx
-import numbers
-from torchvision.models import vgg19
-from einops import rearrange
-
 def batched_index_select(input, dim, index):
     for ii in range(1, len(input.shape)):
         if ii != dim:
@@ -160,15 +155,6 @@ def neirest_neighbores(input_maps, candidate_maps, distances, num_matches):
 
     topk_indices_selected = topk_indices.masked_select(mask)
     topk_indices_selected = topk_indices_selected.reshape(batch_size, num_matches)
-    # indices = (
-    #     torch.arange(0, topk_values.size(1))
-    #     .unsqueeze(0)
-    #     .repeat(batch_size, 1)
-    #     .to(topk_values.device)
-    # )
-    # indices_selected = indices.masked_select(mask)
-    # indices_selected = indices_selected.reshape(batch_size, num_matches)
-    # filtered_input_maps = batched_index_select(input_maps, 1, indices_selected)
     filtered_candidate_maps = batched_index_select(
         candidate_maps, 1, topk_indices_selected
     )
@@ -267,8 +253,6 @@ class FeedForward(nn.Module):
         return project_out
 
 
-
-##########################################################################
 class Attention(nn.Module):
     def __init__(self, dim, num_heads, match_factor=2,ffn_expansion_factor=2,scale_factor=8, bias=True, attention_matching=True):
         super(Attention, self).__init__()
@@ -368,45 +352,6 @@ class Attention_restormer(nn.Module):
         return out
 
 
-
-
-# class NormLayer(nn.Module):
-#     """Normalization Layers.
-#     ------------
-#     # Arguments
-#         - channels: input channels, for batch norm and instance norm.
-#         - input_size: input shape without batch size, for layer norm.
-#     """
-#
-#     def __init__(self, channels, norm_type='in'):
-#         super(NormLayer, self).__init__()
-#         norm_type = norm_type.lower()
-#         self.norm_type = norm_type
-#         self.channels = channels
-#         if norm_type == 'bn':
-#             self.norm = nn.BatchNorm2d(channels, affine=True)
-#         elif norm_type == 'in':
-#             self.norm = nn.InstanceNorm2d(channels, affine=False)
-#         elif norm_type == 'gn':
-#             self.norm = nn.GroupNorm(num_groups=32, num_channels=channels, eps=1e-6, affine=True)
-#         elif norm_type == 'none':
-#             self.norm = lambda x: x * 1.0
-#         else:
-#             assert 1 == 0, 'Norm type {} not support.'.format(norm_type)
-#
-#     def forward(self, x):
-#         return self.norm(x)
-
-
-
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from pdb import set_trace as stx
-import numbers
-
-from einops import rearrange
 
 
 class SFTLayer_torch(nn.Module):
@@ -519,92 +464,6 @@ class ConvNeXtBlock(nn.Module):
         return x
 
 
-# class ConvNeXtBlock(nn.Module):
-#     r""" ConvNeXt Block. There are two equivalent implementations:
-#     (1) DwConv -> LayerNorm (channels_first) -> 1x1 Conv -> GELU -> 1x1 Conv; all in (N, C, H, W)
-#     (2) DwConv -> Permute to (N, H, W, C); LayerNorm (channels_last) -> Linear -> GELU -> Linear; Permute back
-#     We use (2) as we find it slightly faster in PyTorch
-#
-#     Args:
-#         dim (int): Number of input channels.
-#         drop_path (float): Stochastic depth rate. Default: 0.0
-#         layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
-#     """
-#
-#     def __init__(self, dim, drop_path=0.0, layer_scale_init_value=1e-6):
-#         super().__init__()
-#         self.dwconv = nn.Conv2d(
-#             dim, dim, kernel_size=3, padding=1
-#         )  # depthwise conv
-#         # self.norm = ConvNeXtBlockLayerNorm(dim, eps=1e-6)
-#         self.pwconv1 = nn.Sequential(nn.Conv2d(dim,dim,3,1,1),nn.GELU(),nn.Conv2d(dim,dim,3,1,1)) # pointwise/1x1 convs, implemented with linear layers
-#         # self.act = nn.GELU()
-#         # self.pwconv2 = nn.Linear(dim, dim)
-#         # self.gamma = (
-#         #     nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True)
-#         #     if layer_scale_init_value > 0
-#         #     else None
-#         # )
-#         # self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-#
-#     def forward(self, x):
-#         input = x
-#         x = self.dwconv(x)
-#         x = input + x
-#         return x
-
-
-# class ConvNeXtBlock(nn.Module):
-#     r""" ConvNeXt Block. There are two equivalent implementations:
-#     (1) DwConv -> LayerNorm (channels_first) -> 1x1 Conv -> GELU -> 1x1 Conv; all in (N, C, H, W)
-#     (2) DwConv -> Permute to (N, H, W, C); LayerNorm (channels_last) -> Linear -> GELU -> Linear; Permute back
-#     We use (2) as we find it slightly faster in PyTorch
-#
-#     Args:
-#         dim (int): Number of input channels.
-#         drop_path (float): Stochastic depth rate. Default: 0.0
-#         layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
-#     """
-#
-#     def __init__(self, dim, drop_path=0.0, layer_scale_init_value=1e-6):
-#         super().__init__()
-#         # self.dwconv = nn.Conv2d(
-#         #     dim, dim, kernel_size=3, padding=1, groups=dim
-#         # )  # depthwise conv
-#         # # self.norm = ConvNeXtBlockLayerNorm(dim, eps=1e-6)
-#         # self.pwconv1 = nn.Linear(
-#         #     dim, dim
-#         # )  # pointwise/1x1 convs, implemented with linear layers
-#         # self.act = nn.GELU()
-#         # self.pwconv2 = nn.Linear(dim, dim)
-#         # self.gamma = (
-#         #     nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True)
-#         #     if layer_scale_init_value > 0
-#         #     else None
-#         # )
-#         # self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-#
-#         # self.res = nn.Sequential(nn.Conv2d(dim,dim,3,1,1),
-#         #                          nn.GELU(),
-#         #                          nn.Conv2d(dim,dim,3,1,1))
-#         self.res = nn.Sequential(nn.Conv2d(dim, dim, 3, 1, 1))
-#
-#     def forward(self, x):
-#         input = x
-#         # x = self.dwconv(x)
-#         # x = x.permute(0, 2, 3, 1)  # (N, C, H, W) -> (N, H, W, C)
-#         # # x = self.norm(x)
-#         # x = self.pwconv1(x)
-#         # x = self.act(x)
-#         # x = self.pwconv2(x)
-#         # if self.gamma is not None:
-#         #     x = self.gamma * x
-#         # x = x.permute(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
-#         # x = input + self.res(x)
-#         x = self.res(x)
-#         return x
-
-##########################################################################
 class TransformerBlock(nn.Module):
     def __init__(self, dim=32, num_heads=1, match_factor=2, ffn_expansion_factor=2, scale_factor=8, bias=True,
                  LayerNorm_type='WithBias', attention_matching=True, ffn_matching=True, ffn_restormer=False):
@@ -674,27 +533,6 @@ class ResBlock_TransformerBlock(nn.Module):
 
         out = 0.2 * tmp + input
         return out
-
-# class ResBlock_new(nn.Module):
-#     """
-#     Use preactivation version of residual block, the same as taming
-#     """
-#     def __init__(self, channel):
-#         super(ResBlock_new, self).__init__()
-#         self.channel = channel
-#         self.conv = nn.Sequential(
-#             # NormLayer(in_channel, norm_type),
-#             # ActLayer(channel, act_type),
-#             nn.Conv2d(self.channel, self.channel, kernel_size=3, stride=1, padding=1, groups=self.channel, bias=True),
-#             # NormLayer(out_channel, norm_type),
-#             nn.GELU(),
-#             nn.Conv2d(self.channel, self.channel, kernel_size=3, stride=1, padding=1, groups=self.channel, bias=True),
-#         )
-#
-#     def forward(self, input):
-#         res = self.conv(input)
-#         out = res + input
-#         return out
 
 class Perception_fusion(nn.Module):
     def __init__(self, dim=32):
@@ -897,15 +735,6 @@ class FeMaSRNet(nn.Module):
         return output
 
     def forward(self, input):
-        # print('**********************************************************')
-        # print('input',input.size())
-        # print('###########################################################')
-
-        # if gt_indices is not None:
-        #     # in LQ training stage, need to pass GT indices for supervise.
-        #     out_img_structure, feature_structure, out_img_ill_radio, feature_ill_radio, out_img_input_equalize, feature_input_equalize, enhanced, feature_enhanced = self.encode_and_decode(input, lq_equalize=lq_equalize, deep_feature=deep_feature)
-        # else:
-        # in HQ stage, or LQ test stage, no GT indices needed.
         restoration = self.encode_and_decode(input)
 
         return restoration
